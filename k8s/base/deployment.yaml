@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-watch-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-watch-api
+  template:
+    metadata:
+      labels:
+        app: kubernetes-watch-api
+    spec:
+      containers:
+        - name: kubernetes-watch-api
+          image: localhost:5001/kubernetes-watch-api
+
+

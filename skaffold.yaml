@@ -1,0 +1,15 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: test
+build:
+  artifacts:
+    - image: localhost:5001/kubernetes-watch-api
+      docker:
+        dockerfile: Dockerfile
+        target: APP
+deploy:
+  kubectl: {}
+manifests:
+  rawYaml:
+    - k8s/base/deployment.yaml
