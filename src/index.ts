@@ -181,14 +181,15 @@ pipe(
   runnableWithDo,
   Effect.flatMap(({ receiverPipeline }) =>
     pipe(
-      receiverPipeline.await, // Await the fiber
-      Effect.zipRight(Effect.never) // Keep the program alive indefinitely
+      receiverPipeline.await, // Await pipeline
+      // Run both receiverPipeline.await effect and Effect.never, returning only Effect.never, e.g. run forever?
+      Effect.zipRight(Effect.never)
     )
   ),
   Effect.runPromise
 ).then(() => {
   console.log("Pipeline started successfully.");
-}).catch((err: unknown) => { // Explicitly type the error parameter
+}).catch((err: unknown) => {
   console.error("Pipeline failed with error: ", err);
 });
 
