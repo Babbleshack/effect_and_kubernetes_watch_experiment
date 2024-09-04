@@ -1,4 +1,4 @@
-import { Effect, Stream, pipe, StreamEmit, Chunk, Match, Option, Context } from "effect";
+import { Effect, Stream, pipe, StreamEmit, Chunk, Match, Option, Context, Logger } from "effect";
 import { NodeRuntime } from "@effect/platform-node"
 import { KubeConfig, Watch, V1Pod } from '@kubernetes/client-node';
 import {some} from "effect/Option";
@@ -53,16 +53,10 @@ class BackendPodCacheService extends Context.Tag("BackendPodCacheService") <
  */
 const createTestBackendPodCache = () => {
   //const pods = new Map()
-  console.log("CREATING BackendPodCacheService")
   return {
     insert: (backend: Backend) => pipe(
       Effect.log(`INSERTING INTO BackendPodCacheService: ${JSON.stringify(backend)}`),
-      Effect.flatMap(() =>
-        Effect.sync(() => {
-          console.log(`inserting new pod ${backend.name} with IP ${backend.ip}`);
-        })
-      )
-    ),
+    ).pipe(Effect.annotateLogs("Backend", JSON.stringify(backend))),
     delete: (backend: Backend) => pipe(
       Effect.log(`DELETE FROM BackendPodCacheService`),
       Effect.flatMap(() =>
@@ -90,7 +84,6 @@ const createKubernetesWatchEventStream = (namespace: string = 'default')  =>
         }
       }
       const eventHandler = (type: string, apiObj: any, _?: any) => {
-        Effect.logInfo('received Kubernetes Event')
         if( isKuberneteEventType(type) === false) {
           return Effect.fail(new InvalidKubernetesEventTypeError())
         }
@@ -151,7 +144,7 @@ const pipelineWithDo = pipe(
     pipe(
       createKubernetesWatchEventStream(),
       Stream.tap((kpe) =>
-                 Effect.log(`received KubernetesPodEvent: ${JSON.stringify(kpe)}`)
+                 Effect.log(`received KubernetesPodEvent for: ${JSON.stringify(kpe.apiObj.metadata?.name)}`)
       ),
       Stream.mapEffect((kpe) =>
         pipe(
@@ -186,6 +179,7 @@ pipe(
       Effect.zipRight(Effect.never)
     )
   ),
+  Effect.provide(Logger.structured),
   NodeRuntime.runMain
 );
 
