@@ -4,7 +4,8 @@ import { KubeConfig, Watch, V1Pod } from '@kubernetes/client-node';
 import {some} from "effect/Option";
 
 type KubernetesEventType = 'ADDED' | 'MODIFIED' | 'DELETED' | 'BOOKMARK';
-const isKuberneteEventType = (type: string) => {
+// type is <type> -> type assertions
+const isKuberneteEventType = (type: string): type is KubernetesEventType => {
   return type === 'ADDED' || type === 'MODIFIED' || type === 'DELETED' || type === 'BOOKMARK'
 }
 
@@ -44,7 +45,7 @@ class BackendPodCacheService extends Context.Tag("BackendPodCacheService") <
     /**
      * Remove a backend
      */
-    listBackends: () => Effect.Effect<Array<Backend>>
+    listBackends: Effect.Effect<Array<Backend>>
   }
 >() {}
 
@@ -56,22 +57,20 @@ const createTestBackendPodCache = () => {
   return {
     insert: (backend: Backend) => pipe(
       Effect.log(`INSERTING INTO BackendPodCacheService: ${JSON.stringify(backend)}`),
-    ).pipe(Effect.annotateLogs("Backend", JSON.stringify(backend))),
+    ).pipe(Effect.annotateLogs("Backend", backend)),
     delete: (backend: Backend) => pipe(
       Effect.log(`DELETE FROM BackendPodCacheService`),
       Effect.flatMap(() =>
         Effect.sync(() => {
           return Option.none()
-        })
-                    )
-    ).pipe(Effect.annotateLogs("Backend", JSON.stringify(backend))),
-    listBackends: () => pipe(
+        }))
+    ).pipe(Effect.annotateLogs("Backend", backend)),
+    listBackends: pipe(
       Effect.log(`Call listBackends`),
       Effect.flatMap(() => Effect.succeed([]))
     )
   }
 }
-
 
 const createKubernetesWatchEventStream = (namespace: string = 'default')  => 
   Stream.async(
@@ -83,12 +82,13 @@ const createKubernetesWatchEventStream = (namespace: string = 'default')  =>
           emit(Effect.fail(Option.none()))
         }
       }
-      const eventHandler = (type: string, apiObj: any, _?: any) => {
+      // TODO: Investigate Effect.Schema
+      const eventHandler = (type: string, apiObj: V1Pod) => {
         if( isKuberneteEventType(type) === false) {
           return Effect.fail(new InvalidKubernetesEventTypeError())
         }
         const e: KubernetesPodEvent = {
-          type: type as KubernetesEventType,
+          type: type, 
           apiObj
         }
         emit(Effect.succeed(Chunk.of(e)))
@@ -97,6 +97,9 @@ const createKubernetesWatchEventStream = (namespace: string = 'default')  =>
     }
   )
 
+// TODO: Rather than testing if these fields are null use Effect.Schema
+// SEE: Parse dont validate blog post
+  // Ideally this fucntion would only accept a valid V1Pod
 const podToBackend = (pod: Pick<V1Pod,  'metadata' | 'status'> ): Effect.Effect<Backend, Error>  => {
   const name = pod.metadata?.name
   const ip = pod.status?.podIP
@@ -111,32 +114,25 @@ interface BackendPodEvent {
   type: KubernetesEventType
 }
 
-
 const pipelineWithDo = pipe(
   Effect.Do,
   Effect.bind('becs', () => BackendPodCacheService),
   Effect.let("podEventMatcher", ({ becs }) =>
     Match.type<BackendPodEvent>().pipe(
-      Match.when({ type: 'ADDED' }, (_) => (backend: Backend) =>
-                 pipe(
+      Match.when({ type: 'ADDED' }, (e) => pipe(
                    Effect.log("MATCHING INSERT"), // Log the event as an effect
                    Effect.flatMap(() => 
-                                  becs.insert(backend)
+                                  becs.insert(e.backend)
                                  )
                  )
       ),
-      Match.when({ type: 'MODIFIED' }, (_) => (backend: Backend) =>
-                  Effect.log(`MATCHING MODIFIED ${backend}`),
-      ),
-      Match.when({ type: 'DELETED' }, (_) => (backend: Backend) =>
-                 pipe(
-                  Effect.log(`MATCHING DELETE ${backend}`),
-                  Effect.flatMap(() => becs.delete(backend))
+      Match.when({ type: 'MODIFIED' }, (e) => Effect.log(`MATCHING MODIFIED ${e.backend}`)),
+      Match.when({ type: 'DELETED' }, (e) => pipe(
+                  Effect.log(`MATCHING DELETE ${e.backend}`),
+                  Effect.flatMap(() => becs.delete(e.backend))
                  )
       ),
-      Match.when({ type: 'BOOKMARK' }, (_) => (backend: Backend) =>
-                 Effect.log(`BOOKMARK RECEIVED FOR ${backend}`)
-      ),
+      Match.when({ type: 'BOOKMARK' }, (e) => Effect.log(`BOOKMARK RECEIVED FOR ${e.backend}`)),
       Match.exhaustive
     )
   ),
@@ -158,10 +154,7 @@ const pipelineWithDo = pipe(
       Stream.tap((bpe) =>
                  Effect.log(`received BackendPodEvent: ${JSON.stringify(bpe)}`)
       ),
-      Stream.mapEffect((bpe) => {
-        const operation = podEventMatcher(bpe); // Match event type
-        return operation(bpe.backend);          // Apply the operation on backend
-      }),
+      Stream.mapEffect(podEventMatcher),
       Stream.runDrain,
       Effect.fork
     ),
@@ -182,4 +175,6 @@ pipe(
   Effect.provide(Logger.structured),
   NodeRuntime.runMain
 );
+
+console.log("I am something else")
 
