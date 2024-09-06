@@ -1,7 +1,9 @@
-import { Effect, Stream, pipe, StreamEmit, Chunk, Match, Option, Context, Logger } from "effect";
+import { Effect, Stream, pipe, StreamEmit, Chunk, Match, Option, Context, Logger, Schedule, Fiber } from "effect";
 import { NodeRuntime } from "@effect/platform-node"
-import { KubeConfig, Watch, V1Pod } from '@kubernetes/client-node';
+import { KubeConfig, Watch, V1Pod, RequestResult } from '@kubernetes/client-node';
 import {some} from "effect/Option";
+import {promise} from "effect/Effect";
+import {acquire} from "effect/TSemaphore";
 
 type KubernetesEventType = 'ADDED' | 'MODIFIED' | 'DELETED' | 'BOOKMARK';
 // type is <type> -> type assertions
@@ -23,10 +25,6 @@ interface Backend {
   ip: string
 }
 
-const kc = new KubeConfig();
-kc.loadFromDefault();
-
-const watch = new Watch(kc)
 
 /**
  * Service managing Backend Pod Cache
@@ -49,6 +47,7 @@ class BackendPodCacheService extends Context.Tag("BackendPodCacheService") <
   }
 >() {}
 
+
 /**
  * BackendPodCacheService service implementation for testing
  */
@@ -57,6 +56,7 @@ const createTestBackendPodCache = () => {
   return {
     insert: (backend: Backend) => pipe(
       Effect.log(`INSERTING INTO BackendPodCacheService: ${JSON.stringify(backend)}`),
+      Effect.flatMap( () => Effect.sync ( () => console.log(`==== INSERTING INTO BackendPodCacheService: ${JSON.stringify(backend)} ========`)))
     ).pipe(Effect.annotateLogs("Backend", backend)),
     delete: (backend: Backend) => pipe(
       Effect.log(`DELETE FROM BackendPodCacheService`),
@@ -72,7 +72,33 @@ const createTestBackendPodCache = () => {
   }
 }
 
-const createKubernetesWatchEventStream = (namespace: string = 'default')  => 
+const createWatch =  () => Effect.gen(function* () {
+  const kc = new KubeConfig();
+  kc.loadFromDefault();
+  const watch = new Watch(kc)
+  return watch
+})
+
+const kc = new KubeConfig();
+kc.loadFromDefault();
+const watch = new Watch(kc)
+
+//const scoped = Stream.asyncScoped((emit) =>  
+//  Effect.acquireRelease(
+//    Effect.tryPromise({
+//          try: () => watch.watch(
+//            "", 
+//            {}, 
+//            (e) => emit(Effect.succeed(Chunk.of(e))),
+//            (_) => emit(Effect.fail(Option.none()))
+//          ) as unknown,
+//          catch: (e) => new Error(JSON.stringify(e))
+//        }),
+//    (w) => Effect.promise(() => w.abort())
+//  )
+//);
+
+const createKubernetesWatchEventStream = (watch: Watch, namespace: string = 'default')  => 
   Stream.async(
     (emit: StreamEmit.Emit<never, never, KubernetesPodEvent, void>) => {
       const doneHandler = (err: Error) => {
@@ -93,7 +119,10 @@ const createKubernetesWatchEventStream = (namespace: string = 'default')  =>
         }
         emit(Effect.succeed(Chunk.of(e)))
       }
-      watch.watch(`/api/v1/namespaces/${namespace}/pods`, {}, eventHandler, doneHandler)
+      const watchInitPromise = watch.watch(`/api/v1/namespaces/${namespace}/pods`, {}, eventHandler, doneHandler)
+      return Effect.promise(() => watchInitPromise.then((req) => {
+        req.abort()
+      }))
     }
   )
 
@@ -114,17 +143,16 @@ interface BackendPodEvent {
   type: KubernetesEventType
 }
 
-const pipelineWithDo = pipe(
-  Effect.Do,
-  Effect.bind('becs', () => BackendPodCacheService),
-  Effect.let("podEventMatcher", ({ becs }) =>
-    Match.type<BackendPodEvent>().pipe(
+const pipeline = Effect.gen(function* () {
+  const becs = yield* BackendPodCacheService
+  const podEventMatcher = Match.type<BackendPodEvent>().pipe(
       Match.when({ type: 'ADDED' }, (e) => pipe(
                    Effect.log("MATCHING INSERT"), // Log the event as an effect
                    Effect.flatMap(() => 
                                   becs.insert(e.backend)
-                                 )
-                 )
+                                 ),
+                   Effect.flatMap( () => Effect.sync ( () => console.log(`======= MATCHING INSERT: ${e.backend} ========`)))
+                 ),
       ),
       Match.when({ type: 'MODIFIED' }, (e) => Effect.log(`MATCHING MODIFIED ${e.backend}`)),
       Match.when({ type: 'DELETED' }, (e) => pipe(
@@ -135,12 +163,8 @@ const pipelineWithDo = pipe(
       Match.when({ type: 'BOOKMARK' }, (e) => Effect.log(`BOOKMARK RECEIVED FOR ${e.backend}`)),
       Match.exhaustive
     )
-  ),
-  Effect.bind("receiverPipeline", ({ podEventMatcher }) =>
-    pipe(
-      createKubernetesWatchEventStream(),
-      Stream.tap((kpe) =>
-                 Effect.log(`received KubernetesPodEvent for: ${JSON.stringify(kpe.apiObj.metadata?.name)}`)
+    createKubernetesWatchEventStream(watch).pipe(
+      Stream.tap((kpe) => Effect.log(`received KubernetesPodEvent for: ${JSON.stringify(kpe.apiObj.metadata?.name)} type: ${kpe.type}`)
       ),
       Stream.mapEffect((kpe) =>
         pipe(
@@ -155,26 +179,25 @@ const pipelineWithDo = pipe(
                  Effect.log(`received BackendPodEvent: ${JSON.stringify(bpe)}`)
       ),
       Stream.mapEffect(podEventMatcher),
-      Stream.runDrain,
-      Effect.fork
-    ),
-  ),
-)
-
-const runnableWithDo = Effect.provideService(pipelineWithDo, BackendPodCacheService, createTestBackendPodCache())
-
-pipe(
-  runnableWithDo,
-  Effect.flatMap(({ receiverPipeline }) =>
-    pipe(
-      receiverPipeline.await, // Await pipeline
-      // Run both receiverPipeline.await effect and Effect.never, returning only Effect.never, e.g. run forever?
-      Effect.zipRight(Effect.never)
     )
-  ),
-  Effect.provide(Logger.structured),
-  NodeRuntime.runMain
-);
+    Stream.run
+})
 
-console.log("I am something else")
+const runnable = Effect.provideService(pipeline, BackendPodCacheService, createTestBackendPodCache())
+const fiber = Effect.runFork(runnable)
+
+setTimeout(() => {
+  console.log("ABOUT TO INTERUPT")
+  Effect.runPromiseExit(
+    pipe (
+      Fiber.interrupt(fiber),
+      Effect.map((exit) => {
+        console.log(`GOT EXIT ${exit}`)
+      })
+    )
+  )
+  console.log(`RETURNING: ${JSON.stringify(fiber.status)}`)
+}, 60000)
+
+setInterval(() => console.log("working...."), 1000)
 
